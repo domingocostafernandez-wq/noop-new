@@ -1,0 +1,130 @@
+name: Build NOOP con temporizador
+# Compila NOOP (ryanbr/noop, version 12.0.0, la misma build 435 que tienes) con UN solo cambio:
+# accion de doble toque "2-minute timer". Genera un .ipa sin firmar para AltStore/SideStore/Sideloadly.
+on:
+  workflow_dispatch:
+
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Descargar NOOP original
+        run: |
+          git clone https://github.com/ryanbr/noop.git noop
+          cd noop
+          git checkout 7acce06c3d22cb5dfe959f2c4a43902471d21332
+
+      - name: Aplicar el cambio del temporizador (solo 2 archivos)
+        working-directory: noop
+        run: |
+          cat > ../timer.patch <<'PATCH'
+          diff --git a/Strand/App/AppModel.swift b/Strand/App/AppModel.swift
+          index b477b8b..1f5007b 100644
+          --- a/Strand/App/AppModel.swift
+          +++ b/Strand/App/AppModel.swift
+          @@ -190,6 +190,8 @@ final class AppModel: ObservableObject {
+               let stressNudgeCenter = StressNudgeCenter()
+           
+               private var lastDoubleTapAt: Date = .distantPast
+          +    /// The running double-tap timer (`MacActionKind.timer2min`), nil when none is running.
+          +    private var doubleTapTimerTask: Task<Void, Never>?
+               private var lastCoachZone: Int = -1
+               // L3 stress-onset detector state: a rolling R-R buffer + the replay-safe detector state (persisted
+               // via BiofeedbackPrefs so a relaunch can't re-fire), carried verbatim between evaluations.
+          @@ -1825,10 +1827,26 @@ final class AppModel: ObservableObject {
+                   case .markMoment: markMoment()
+                   case .sleepMark: markSleep()
+                   case .hapticClock: ble.buzzTimeNow(is24h: Self.localeUses24HourClock)
+          +        case .timer2min: startDoubleTapTimer()
+                   case .runShortcut: MacActions.runShortcut(shortcut)
+                   }
+               }
+           
+          +    /// Double-tap 2-minute timer: one buzz to confirm the start, a full buzz when the 2 minutes are up.
+          +    /// A new double-tap while it runs restarts it from zero.
+          +    func startDoubleTapTimer(seconds: UInt64 = 120) {
+          +        doubleTapTimerTask?.cancel()
+          +        buzz(loops: 1)
+          +        live.append(log: Self.stamped("Timer: started (\(seconds / 60) min)"))
+          +        doubleTapTimerTask = Task { @MainActor [weak self] in
+          +            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+          +            guard !Task.isCancelled, let self else { return }
+          +            self.buzzStrapOnce()
+          +            self.live.append(log: Self.stamped("Timer: done"))
+          +            self.doubleTapTimerTask = nil
+          +        }
+          +    }
+          +
+               /// Whether the user's locale formats time on a 24-hour clock , drives the Haptic Clock's hour
+               /// encoding (#460) so a double-tap buzzes the time the way the user reads it. Derived from the
+               /// locale's "j" (hour) template: a 12-hour locale includes the AM/PM ("a") symbol.
+          diff --git a/Strand/System/MacActions.swift b/Strand/System/MacActions.swift
+          index 5a257c1..0de96f5 100644
+          --- a/Strand/System/MacActions.swift
+          +++ b/Strand/System/MacActions.swift
+          @@ -11,6 +11,7 @@ enum MacActionKind: String, Codable, CaseIterable, Identifiable {
+               case markMoment
+               case sleepMark
+               case hapticClock
+          +    case timer2min
+               case runShortcut
+           
+               var id: String { rawValue }
+          @@ -22,6 +23,7 @@ enum MacActionKind: String, Codable, CaseIterable, Identifiable {
+                   case .markMoment:  return String(localized: "Mark a moment")
+                   case .sleepMark:   return String(localized: "Log a sleep mark")
+                   case .hapticClock: return String(localized: "Buzz the time")
+          +        case .timer2min:   return String(localized: "2-minute timer")
+                   case .runShortcut: return String(localized: "Run a Shortcut…")
+                   }
+               }
+          @@ -33,6 +35,7 @@ enum MacActionKind: String, Codable, CaseIterable, Identifiable {
+                   case .markMoment:  return "mappin.and.ellipse"
+                   case .sleepMark:   return "moon.zzz.fill"
+                   case .hapticClock: return "clock.fill"
+          +        case .timer2min:   return "timer"
+                   case .runShortcut: return "bolt.fill"
+                   }
+               }
+          PATCH
+          git apply --whitespace=nowarn ../timer.patch
+          echo "Archivos cambiados:"
+          git diff --stat
+          test "$(git diff --name-only | wc -l | tr -d ' ')" = "2"
+
+      - name: Instalar XcodeGen y generar proyecto
+        working-directory: noop
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Compilar para iPhone (Release, sin firmar)
+        working-directory: noop
+        run: >-
+          xcodebuild -scheme NOOPiOS -configuration Release -destination 'generic/platform=iOS'
+          -derivedDataPath build/dd
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          build
+
+      - name: Empaquetar .ipa y verificar que use los mismos IDs que la app original
+        working-directory: noop
+        run: |
+          APP=$(find build/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)
+          test -n "$APP"
+          ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          GROUP=$(/usr/libexec/PlistBuddy -c 'Print :AppGroupIdentifier' "$APP/Info.plist")
+          echo "Bundle ID: $ID"
+          echo "App Group: $GROUP"
+          test "$ID" = "com.noopapp.noop"
+          test "$GROUP" = "group.com.noopapp.noop.staging"
+          rm -rf "$APP/Watch"
+          Tools/prepare-ios-sideload-app.sh "$APP"
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
+          zip -qr ../NOOP-timer.ipa Payload
+
+      - name: Subir el .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOOP-timer-ipa
+          path: NOOP-timer.ipa
